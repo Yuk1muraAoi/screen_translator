@@ -29,10 +29,11 @@ class TranslationSignals(QObject):
 
 
 class TranslationTask(QRunnable):
-    def __init__(self, pixmap: QPixmap, prompt: str) -> None:
+    def __init__(self, pixmap: QPixmap, prompt: str, context: list[str] | None = None) -> None:
         super().__init__()
         self.pixmap = pixmap
         self.prompt = prompt
+        self.context = context or []
         self.signals = TranslationSignals()
 
     @pyqtSlot()
@@ -53,6 +54,7 @@ class TranslationTask(QRunnable):
             http_client = httpx.Client(timeout=60.0)
             client = OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
             image_url = pixmap_to_png_data_url(self.pixmap)
+            text_prompt = self._build_prompt()
 
             response = client.chat.completions.create(
                 model=model,
@@ -60,7 +62,7 @@ class TranslationTask(QRunnable):
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": self.prompt},
+                            {"type": "text", "text": text_prompt},
                             {"type": "image_url", "image_url": {"url": image_url}},
                         ],
                     }
@@ -72,6 +74,22 @@ class TranslationTask(QRunnable):
         except Exception as exc:  # noqa: BLE001 - surface API/configuration errors to the UI.
             self.signals.failed.emit(str(exc))
 
+    def _build_prompt(self) -> str:
+        if not self.context:
+            return self.prompt
+
+        context_text = "\n\n".join(
+            f"第 {index} 轮翻译结果:\n{text}"
+            for index, text in enumerate(self.context, start=1)
+            if text.strip()
+        )
+        return (
+            f"{self.prompt}\n\n"
+            "以下是同一翻译项目之前的翻译结果，只作为术语、人名、地名和上下文参考，"
+            "不要复述这些内容：\n"
+            f"{context_text}"
+        )
+
 
 class Translator(QObject):
     def __init__(self) -> None:
@@ -82,11 +100,12 @@ class Translator(QObject):
         self,
         pixmap: QPixmap,
         prompt: str,
+        context: list[str] | None,
         on_started,
         on_finished,
         on_failed,
     ) -> None:
-        task = TranslationTask(pixmap, prompt)
+        task = TranslationTask(pixmap, prompt, context)
         task.signals.started.connect(on_started)
         task.signals.finished.connect(on_finished)
         task.signals.failed.connect(on_failed)

@@ -8,9 +8,13 @@ from PyQt5.QtWidgets import (
     QDialogButtonBox,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -24,6 +28,7 @@ from PyQt5.QtWidgets import (
 from .capture import RegionSelector, capture_desktop, virtual_geometry
 from .config import AppConfig, load_config, save_config
 from .hotkeys import GlobalHotkeyManager
+from .projects import ProjectStore, TEMP_PROJECT_ID, TranslationProject, TranslationRecord
 from .translator import Translator
 
 
@@ -73,7 +78,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.full_hotkey)
         layout.addWidget(QLabel("选区截图快捷键"))
         layout.addWidget(self.region_hotkey)
-        layout.addWidget(QLabel("翻译提示词"))
+        layout.addWidget(QLabel("全局默认提示词"))
         layout.addWidget(self.prompt)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -88,50 +93,102 @@ class SettingsDialog(QDialog):
         return config
 
 
+class PromptDialog(QDialog):
+    def __init__(self, title: str, prompt: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(560)
+        self.editor = QTextEdit(prompt)
+        self.editor.setMinimumHeight(220)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("项目提示词"))
+        layout.addWidget(self.editor)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def prompt(self) -> str:
+        return self.editor.toPlainText().strip()
+
+
 class ChatBubble(QFrame):
-    def __init__(self, pixmap: QPixmap, text: str = "") -> None:
+    def __init__(
+        self,
+        project_id: str,
+        round_number: int,
+        pixmap: QPixmap | None,
+        text: str = "",
+    ) -> None:
         super().__init__()
+        self.project_id = project_id
+        self.round_number = round_number
         self.setObjectName("bubble")
         self.setFrameShape(QFrame.NoFrame)
 
-        image = QLabel()
-        image.setAlignment(Qt.AlignCenter)
-        image.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        scaled = pixmap.scaled(QSize(360, 220), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        image.setPixmap(scaled)
+        self.image = QLabel()
+        self.image.setAlignment(Qt.AlignCenter)
+        self.image.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.image.setMinimumHeight(72)
+        if pixmap and not pixmap.isNull():
+            scaled = pixmap.scaled(QSize(360, 220), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.image.setPixmap(scaled)
+        else:
+            self.image.setText("图片文件缺失")
+            self.image.setObjectName("missingImage")
 
         self.translation = QTextEdit(text)
         self.translation.setPlaceholderText("翻译结果会显示在这里，也可以直接手动修改。")
         self.translation.setMinimumHeight(120)
 
+        self.retry_button = make_button("重试", "使用同一张截图重新调用模型")
+        self.retry_button.setFixedWidth(72)
+
+        footer = QHBoxLayout()
+        footer.setContentsMargins(0, 0, 0, 0)
+        footer.addStretch(1)
+        footer.addWidget(self.retry_button)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
-        layout.addWidget(image)
+        layout.addWidget(self.image)
         layout.addWidget(self.translation)
+        layout.addLayout(footer)
+
+    def set_translation(self, text: str) -> None:
+        self.translation.blockSignals(True)
+        self.translation.setPlainText(text)
+        self.translation.blockSignals(False)
 
 
 class FloatingWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.config = load_config()
+        self.store = ProjectStore(self.config.prompt, self.config.temp_prompt)
         self.translator = Translator()
         self.hotkeys = GlobalHotkeyManager()
         self.drag_position: QPoint | None = None
         self.region_selector: RegionSelector | None = None
-        self.current_bubble: ChatBubble | None = None
         self.expanded_geometry: QRect | None = None
         self.side_tab: QPushButton | None = None
         self.collapsed = False
         self.edge = "right"
+        self.current_project_id = TEMP_PROJECT_ID
+        self.loading_project = False
+        self.temp_pixmaps: dict[int, QPixmap] = {}
 
         self.setWindowTitle("截图翻译")
         self.setWindowIcon(QIcon())
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.resize(self.config.window_width, self.config.window_height)
+        self.resize(max(self.config.window_width, 620), max(self.config.window_height, 620))
         self._build_ui()
         self._apply_style()
+        self._refresh_project_list(self.config.selected_project_id)
         self._register_hotkeys()
 
         app = QApplication.instance()
@@ -152,15 +209,17 @@ class FloatingWindow(QMainWindow):
 
         self.full_button = make_button("全屏", "截取全屏并翻译")
         self.region_button = make_button("选区", "框选屏幕区域并翻译")
-        self.settings_button = make_button("设置", "修改快捷键和提示词")
+        self.delete_last_button = make_button("删末轮", "删除当前项目最后一轮截图和翻译结果")
+        self.settings_button = make_button("设置", "修改全局快捷键和默认提示词")
         self.collapse_button = make_button("收起", "收缩成侧边栏")
         self.close_button = make_button("×", "退出")
         self.close_button.setFixedWidth(38)
 
         self.full_button.clicked.connect(self.capture_full_screen)
         self.region_button.clicked.connect(self.capture_region)
+        self.delete_last_button.clicked.connect(self.delete_last_round)
         self.settings_button.clicked.connect(self.open_settings)
-        self.collapse_button.clicked.connect(lambda: self.collapse_to_edge())
+        self.collapse_button.clicked.connect(self.collapse_to_edge)
         self.close_button.clicked.connect(QApplication.quit)
 
         header = QHBoxLayout()
@@ -170,9 +229,29 @@ class FloatingWindow(QMainWindow):
         header.addStretch(1)
         header.addWidget(self.full_button)
         header.addWidget(self.region_button)
+        header.addWidget(self.delete_last_button)
         header.addWidget(self.settings_button)
         header.addWidget(self.collapse_button)
         header.addWidget(self.close_button)
+
+        self.project_list = QListWidget()
+        self.project_list.setObjectName("projectList")
+        self.project_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.project_list.currentItemChanged.connect(self._project_selection_changed)
+        self.project_list.customContextMenuRequested.connect(self._show_project_menu)
+
+        self.new_project_button = make_button("新建项目", "创建一个独立的翻译项目")
+        self.new_project_button.clicked.connect(self.create_project)
+
+        sidebar = QWidget()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(152)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(12, 8, 8, 12)
+        sidebar_layout.setSpacing(8)
+        sidebar_layout.addWidget(QLabel("项目"))
+        sidebar_layout.addWidget(self.project_list)
+        sidebar_layout.addWidget(self.new_project_button)
 
         self.scroll_body = QWidget()
         self.chat_layout = QVBoxLayout(self.scroll_body)
@@ -183,23 +262,30 @@ class FloatingWindow(QMainWindow):
         self.empty_label = QLabel("点击“全屏”或“选区”开始截图翻译")
         self.empty_label.setObjectName("empty")
         self.empty_label.setAlignment(Qt.AlignCenter)
-        self.chat_layout.insertWidget(0, self.empty_label)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setWidget(self.scroll_body)
 
-        self.status = QLabel(
-            f"快捷键: 全屏 {self.config.full_screen_hotkey}    选区 {self.config.region_hotkey}"
-        )
+        self.status = QLabel()
         self.status.setObjectName("status")
+
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(scroll)
+        right_layout.addWidget(self.status)
+
+        content = QHBoxLayout()
+        content.setContentsMargins(0, 0, 0, 0)
+        content.addWidget(sidebar)
+        content.addWidget(right_panel, 1)
 
         layout = QVBoxLayout(root)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(header)
-        layout.addWidget(scroll)
-        layout.addWidget(self.status)
+        layout.addLayout(content, 1)
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
@@ -209,12 +295,37 @@ class FloatingWindow(QMainWindow):
                 border: 1px solid #cbd5e1;
                 border-radius: 10px;
             }
+            QWidget#sidebar {
+                background: #eef2f7;
+                border-top: 1px solid #dbe3ee;
+                border-right: 1px solid #dbe3ee;
+            }
+            QListWidget#projectList {
+                background: #ffffff;
+                color: #172033;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                outline: none;
+            }
+            QListWidget#projectList::item {
+                padding: 8px;
+                border-radius: 4px;
+            }
+            QListWidget#projectList::item:selected {
+                background: #d9ebff;
+                color: #0f172a;
+            }
             QLabel#title {
                 color: #172033;
             }
             QLabel#empty {
                 color: #64748b;
                 padding: 60px 16px;
+            }
+            QLabel#missingImage {
+                color: #94a3b8;
+                background: #f1f5f9;
+                border-radius: 6px;
             }
             QLabel#status {
                 color: #64748b;
@@ -262,12 +373,188 @@ class FloatingWindow(QMainWindow):
                 self.capture_full_screen,
             )
             self.hotkeys.register(HOTKEY_REGION, self.config.region_hotkey, self.capture_region)
-            self.status.setText(
-                f"快捷键: 全屏 {self.config.full_screen_hotkey}    选区 {self.config.region_hotkey}"
-            )
+            self._set_ready_status()
         except Exception as exc:  # noqa: BLE001 - show actionable shortcut conflicts in-app.
             self.status.setText(str(exc))
             QMessageBox.warning(self, "快捷键注册失败", str(exc))
+
+    def _refresh_project_list(self, selected_project_id: str | None = None) -> None:
+        self.project_list.blockSignals(True)
+        self.project_list.clear()
+        selected_row = 0
+        for row, project in enumerate(self.store.all_projects()):
+            label = project.name
+            if project.is_temporary:
+                label = "★ 临时翻译"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, project.project_id)
+            self.project_list.addItem(item)
+            if project.project_id == selected_project_id:
+                selected_row = row
+        self.project_list.setCurrentRow(selected_row)
+        self.project_list.blockSignals(False)
+        item = self.project_list.currentItem()
+        if item:
+            self.select_project(item.data(Qt.UserRole))
+
+    def _project_selection_changed(
+        self,
+        current: QListWidgetItem | None,
+        previous: QListWidgetItem | None,
+    ) -> None:
+        del previous
+        if current:
+            self.select_project(current.data(Qt.UserRole))
+
+    def select_project(self, project_id: str) -> None:
+        self.current_project_id = project_id
+        self.config.selected_project_id = project_id
+        save_config(self.config)
+        self._load_project_messages()
+        self._set_ready_status()
+
+    def _load_project_messages(self) -> None:
+        self.loading_project = True
+        self._clear_chat()
+        project = self.current_project()
+        for record in project.records:
+            if record.round == 0:
+                continue
+            pixmap = self._pixmap_for_record(project, record)
+            self._add_bubble(project.project_id, record.round, pixmap, record.translation)
+
+        if not self._has_message_bubbles():
+            self.chat_layout.insertWidget(0, self.empty_label)
+            self.empty_label.show()
+        self.loading_project = False
+
+    def _clear_chat(self) -> None:
+        self.empty_label.setParent(None)
+        while self.chat_layout.count() > 1:
+            item = self.chat_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+    def _has_message_bubbles(self) -> bool:
+        for index in range(self.chat_layout.count()):
+            widget = self.chat_layout.itemAt(index).widget()
+            if isinstance(widget, ChatBubble):
+                return True
+        return False
+
+    def _pixmap_for_record(
+        self,
+        project: TranslationProject,
+        record: TranslationRecord,
+    ) -> QPixmap | None:
+        if project.is_temporary:
+            return self.temp_pixmaps.get(record.round)
+        image_path = self.store.image_path_for(project, record)
+        if image_path and image_path.exists():
+            return QPixmap(str(image_path))
+        return None
+
+    def _add_bubble(
+        self,
+        project_id: str,
+        round_number: int,
+        pixmap: QPixmap | None,
+        text: str,
+    ) -> ChatBubble:
+        self.empty_label.hide()
+        self.empty_label.setParent(None)
+        bubble = ChatBubble(project_id, round_number, pixmap, text)
+        bubble.translation.textChanged.connect(lambda bubble=bubble: self._bubble_text_changed(bubble))
+        bubble.retry_button.clicked.connect(lambda checked=False, bubble=bubble: self.retry_translation(bubble))
+        self.chat_layout.insertWidget(max(0, self.chat_layout.count() - 1), bubble)
+        return bubble
+
+    def _bubble_text_changed(self, bubble: ChatBubble) -> None:
+        if self.loading_project:
+            return
+        self.store.update_record_translation(
+            bubble.project_id,
+            bubble.round_number,
+            bubble.translation.toPlainText(),
+        )
+
+    def current_project(self) -> TranslationProject:
+        return self.store.get(self.current_project_id)
+
+    def create_project(self) -> None:
+        project = self.store.create_project()
+        self._refresh_project_list(project.project_id)
+
+    def _show_project_menu(self, position: QPoint) -> None:
+        item = self.project_list.itemAt(position)
+        if not item:
+            return
+        project_id = item.data(Qt.UserRole)
+        project = self.store.get(project_id)
+
+        menu = QMenu(self)
+        prompt_action = menu.addAction("修改提示词")
+        rename_action = None
+        delete_action = None
+        if not project.is_temporary:
+            rename_action = menu.addAction("修改名称")
+            delete_action = menu.addAction("删除项目")
+
+        action = menu.exec_(self.project_list.mapToGlobal(position))
+        if action == prompt_action:
+            self.edit_project_prompt(project_id)
+        elif rename_action and action == rename_action:
+            self.rename_project(project_id)
+        elif delete_action and action == delete_action:
+            self.delete_project(project_id)
+
+    def edit_project_prompt(self, project_id: str) -> None:
+        project = self.store.get(project_id)
+        dialog = PromptDialog(f"{project.name} - 提示词", project.prompt, self)
+        if dialog.exec_() == QDialog.Accepted:
+            prompt = dialog.prompt()
+            if not prompt:
+                return
+            self.store.update_prompt(project_id, prompt)
+            if project_id == TEMP_PROJECT_ID:
+                self.config.temp_prompt = prompt
+                save_config(self.config)
+            self._set_ready_status()
+
+    def rename_project(self, project_id: str) -> None:
+        project = self.store.get(project_id)
+        name, ok = QInputDialog.getText(self, "修改项目名称", "项目名称", text=project.name)
+        if not ok or not name.strip():
+            return
+        updated = self.store.rename_project(project_id, name.strip())
+        self._refresh_project_list(updated.project_id)
+
+    def delete_project(self, project_id: str) -> None:
+        project = self.store.get(project_id)
+        reply = QMessageBox.question(
+            self,
+            "删除项目",
+            f"确认删除项目“{project.name}”？该项目的历史截图和 JSON 会一起删除。",
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.store.delete_project(project_id)
+        self._refresh_project_list(TEMP_PROJECT_ID)
+
+    def delete_last_round(self) -> None:
+        project = self.current_project()
+        deleted = self.store.delete_last_record(project.project_id)
+        if not deleted:
+            self.status.setText("当前项目没有可删除的翻译轮次。")
+            return
+
+        if project.is_temporary:
+            self.temp_pixmaps.pop(deleted.round, None)
+
+        self._load_project_messages()
+        self._set_ready_status()
+        self.status.setText(f"已删除最后一轮翻译：第 {deleted.round} 轮。")
 
     def capture_full_screen(self) -> None:
         self.expand_from_edge()
@@ -297,37 +584,126 @@ class FloatingWindow(QMainWindow):
         self._translate_pixmap(pixmap)
 
     def _translate_pixmap(self, pixmap: QPixmap) -> None:
-        if self.empty_label:
-            self.empty_label.hide()
+        project = self.current_project()
+        context = project.context_translations()
+        record = self.store.add_record(project.project_id, pixmap, "正在翻译...")
+        if project.is_temporary:
+            self.temp_pixmaps[record.round] = pixmap
 
-        bubble = ChatBubble(pixmap, "正在翻译...")
-        self.current_bubble = bubble
-        self.chat_layout.insertWidget(max(0, self.chat_layout.count() - 1), bubble)
+        bubble = self._add_bubble(project.project_id, record.round, pixmap, record.translation)
+        bubble.retry_button.setEnabled(False)
         self.translator.translate(
             pixmap,
-            self.config.prompt,
+            project.prompt,
+            context,
             on_started=lambda: self.status.setText("正在调用大模型 API..."),
-            on_finished=self._translation_finished,
-            on_failed=self._translation_failed,
+            on_finished=lambda text, pid=project.project_id, rnd=record.round: self._translation_finished(
+                pid,
+                rnd,
+                text,
+            ),
+            on_failed=lambda error, pid=project.project_id, rnd=record.round: self._translation_failed(
+                pid,
+                rnd,
+                error,
+            ),
+        )
+        bubble.translation.setFocus()
+
+    def retry_translation(self, bubble: ChatBubble) -> None:
+        project = self.store.get(bubble.project_id)
+        record = self._record_for(project, bubble.round_number)
+        if not record:
+            self.status.setText("重试失败：找不到这条翻译记录。")
+            return
+
+        pixmap = self._pixmap_for_record(project, record)
+        if not pixmap or pixmap.isNull():
+            self.status.setText("重试失败：找不到原始截图。")
+            return
+
+        context = [
+            item.translation.strip()
+            for item in project.records
+            if item.round > 0
+            and item.round != bubble.round_number
+            and item.translation.strip()
+            and item.translation.strip() != "正在翻译..."
+            and item.translation.strip() != "正在重新翻译..."
+            and not item.translation.strip().startswith("翻译失败:")
+        ]
+
+        bubble.retry_button.setEnabled(False)
+        bubble.set_translation("正在重新翻译...")
+        self.store.update_record_translation(project.project_id, bubble.round_number, "正在重新翻译...")
+        self.translator.translate(
+            pixmap,
+            project.prompt,
+            context,
+            on_started=lambda: self.status.setText("正在重试调用大模型 API..."),
+            on_finished=lambda text, pid=project.project_id, rnd=bubble.round_number: self._translation_finished(
+                pid,
+                rnd,
+                text,
+            ),
+            on_failed=lambda error, pid=project.project_id, rnd=bubble.round_number: self._translation_failed(
+                pid,
+                rnd,
+                error,
+            ),
         )
 
-    def _translation_finished(self, text: str) -> None:
-        if self.current_bubble:
-            self.current_bubble.translation.setPlainText(text or "未返回翻译结果")
+    def _record_for(self, project: TranslationProject, round_number: int) -> TranslationRecord | None:
+        for record in project.records:
+            if record.round == round_number:
+                return record
+        return None
+
+    def _translation_finished(self, project_id: str, round_number: int, text: str) -> None:
+        result = text or "未返回翻译结果"
+        self.store.update_record_translation(project_id, round_number, result)
+        bubble = self._find_bubble(project_id, round_number)
+        if bubble:
+            bubble.set_translation(result)
+            bubble.retry_button.setEnabled(True)
         self.status.setText("翻译完成，可直接编辑结果。")
 
-    def _translation_failed(self, error: str) -> None:
-        if self.current_bubble:
-            self.current_bubble.translation.setPlainText(f"翻译失败:\n{error}")
+    def _translation_failed(self, project_id: str, round_number: int, error: str) -> None:
+        result = f"翻译失败:\n{error}"
+        self.store.update_record_translation(project_id, round_number, result)
+        bubble = self._find_bubble(project_id, round_number)
+        if bubble:
+            bubble.set_translation(result)
+            bubble.retry_button.setEnabled(True)
         self.status.setText("翻译失败，请检查 .env、网络或模型是否支持图片输入。")
+
+    def _find_bubble(self, project_id: str, round_number: int) -> ChatBubble | None:
+        for index in range(self.chat_layout.count()):
+            widget = self.chat_layout.itemAt(index).widget()
+            if (
+                isinstance(widget, ChatBubble)
+                and widget.project_id == project_id
+                and widget.round_number == round_number
+            ):
+                return widget
+        return None
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.config, self)
         if dialog.exec_() == QDialog.Accepted:
             self.config = dialog.apply_to(self.config)
+            self.store.default_prompt = self.config.prompt
             save_config(self.config)
             self.hotkeys.unregister_all()
             self._register_hotkeys()
+
+    def _set_ready_status(self) -> None:
+        project = self.current_project()
+        context_hint = "无上下文" if project.is_temporary else f"{len(project.context_translations())} 条上下文"
+        self.status.setText(
+            f"当前项目: {project.name}    {context_hint}    "
+            f"快捷键: 全屏 {self.config.full_screen_hotkey}    选区 {self.config.region_hotkey}"
+        )
 
     def collapse_to_edge(self) -> None:
         if self.collapsed:
@@ -351,7 +727,7 @@ class FloatingWindow(QMainWindow):
             return
         self.setMinimumSize(0, 0)
         self.setMaximumSize(16777215, 16777215)
-        self.resize(self.config.window_width, self.config.window_height)
+        self.resize(max(self.config.window_width, 620), max(self.config.window_height, 620))
         self._set_collapsed_ui(False)
         if self.expanded_geometry:
             self.setGeometry(self.expanded_geometry)
@@ -407,11 +783,17 @@ class FloatingWindow(QMainWindow):
         screen = QApplication.screenAt(self.geometry().center()) or QApplication.primaryScreen()
         screen_geometry = screen.availableGeometry()
         margin = 4
-        return self.x() <= screen_geometry.left() + margin or self.geometry().right() >= screen_geometry.right() - margin
+        return (
+            self.x() <= screen_geometry.left() + margin
+            or self.geometry().right() >= screen_geometry.right() - margin
+        )
 
     def closeEvent(self, event) -> None:
-        self.config.window_width = max(320, self.width())
-        self.config.window_height = max(420, self.height())
+        if not self.collapsed:
+            self.config.window_width = max(620, self.width())
+            self.config.window_height = max(420, self.height())
+        self.config.selected_project_id = self.current_project_id
+        self.config.temp_prompt = self.store.temp_project.prompt
         save_config(self.config)
         self.hotkeys.unregister_all()
         super().closeEvent(event)

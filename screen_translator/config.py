@@ -20,6 +20,8 @@ class AppConfig:
     full_screen_hotkey: str = "Ctrl+Alt+F"
     region_hotkey: str = "Ctrl+Alt+A"
     prompt: str = DEFAULT_PROMPT
+    temp_prompt: str = DEFAULT_PROMPT
+    selected_project_id: str = "__temporary__"
     window_width: int = 430
     window_height: int = 620
 
@@ -43,4 +45,3 @@ def save_config(config: AppConfig) -> None:
         json.dumps(asdict(config), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-
