@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+
 from PyQt5.QtCore import QPoint, QRect, QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QIcon, QKeySequence, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QInputDialog,
@@ -34,6 +42,7 @@ from .translator import Translator
 
 HOTKEY_FULL_SCREEN = 101
 HOTKEY_REGION = 102
+HOTKEY_COLLAPSE = 103
 
 
 def make_button(text: str, tooltip: str = "") -> QPushButton:
@@ -135,12 +144,15 @@ class SideTabButton(QPushButton):
 class SettingsDialog(QDialog):
     def __init__(self, config: AppConfig, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.model_tester = Translator()
+        self.model_tester = Translator(config.disable_thinking)
         self.setWindowTitle("设置")
         self.setMinimumWidth(520)
 
         self.full_hotkey = ShortcutEdit(config.full_screen_hotkey)
         self.region_hotkey = ShortcutEdit(config.region_hotkey)
+        self.collapse_hotkey = ShortcutEdit(config.collapse_hotkey)
+        self.disable_thinking = QCheckBox("关闭思考模式")
+        self.disable_thinking.setChecked(config.disable_thinking)
         self.prompt = make_plain_text_edit(config.prompt)
         self.prompt.setMinimumHeight(160)
         self.env_editor = make_plain_text_edit(load_env_text())
@@ -153,6 +165,9 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.full_hotkey)
         layout.addWidget(QLabel("选区截图快捷键"))
         layout.addWidget(self.region_hotkey)
+        layout.addWidget(QLabel("收起/展开快捷键"))
+        layout.addWidget(self.collapse_hotkey)
+        layout.addWidget(self.disable_thinking)
         layout.addWidget(QLabel("全局默认提示词"))
         layout.addWidget(self.prompt)
         layout.addWidget(QLabel("模型 .env 配置"))
@@ -169,6 +184,8 @@ class SettingsDialog(QDialog):
     def apply_to(self, config: AppConfig) -> AppConfig:
         config.full_screen_hotkey = self.full_hotkey.text().strip()
         config.region_hotkey = self.region_hotkey.text().strip()
+        config.collapse_hotkey = self.collapse_hotkey.text().strip()
+        config.disable_thinking = self.disable_thinking.isChecked()
         config.prompt = self.prompt.toPlainText().strip()
         return config
 
@@ -177,6 +194,7 @@ class SettingsDialog(QDialog):
 
     def test_model(self) -> None:
         save_env_text(self.env_text())
+        self.model_tester.set_disable_thinking(self.disable_thinking.isChecked())
         self.test_model_button.setEnabled(False)
         self.test_model_button.setText("测试中...")
         self.model_tester.test_model(
@@ -290,12 +308,26 @@ class ChatBubble(QFrame):
         self.original_text.blockSignals(False)
 
 
+class AddImageBox(QPushButton):
+    def __init__(self) -> None:
+        super().__init__("+")
+        self.setObjectName("addImageBox")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("从剪贴板读取图片链接或 base64 图片并翻译")
+        self.setMinimumHeight(92)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        font = self.font()
+        font.setPointSize(24)
+        font.setBold(True)
+        self.setFont(font)
+
+
 class FloatingWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.config = load_config()
         self.store = ProjectStore(self.config.prompt, self.config.temp_prompt)
-        self.translator = Translator()
+        self.translator = Translator(self.config.disable_thinking)
         self.hotkeys = GlobalHotkeyManager()
         self.drag_position: QPoint | None = None
         self.region_selector: RegionSelector | None = None
@@ -384,6 +416,9 @@ class FloatingWindow(QMainWindow):
         self.chat_layout.setContentsMargins(12, 8, 12, 12)
         self.chat_layout.setSpacing(12)
         self.chat_layout.addStretch(1)
+        self.add_image_box = AddImageBox()
+        self.add_image_box.clicked.connect(self.import_clipboard_image)
+        self.chat_layout.addWidget(self.add_image_box)
 
         self.empty_label = QLabel("点击“全屏”或“选区”开始截图翻译")
         self.empty_label.setObjectName("empty")
@@ -476,6 +511,18 @@ class FloatingWindow(QMainWindow):
             QPushButton:pressed {
                 background: #d9ebff;
             }
+            QPushButton#addImageBox {
+                background: #ffffff;
+                color: #64748b;
+                border: 2px dashed #b6c3d1;
+                border-radius: 8px;
+                padding: 0;
+            }
+            QPushButton#addImageBox:hover {
+                background: #f0f7ff;
+                color: #2563eb;
+                border-color: #7db7ee;
+            }
             QFrame#bubble {
                 background: #ffffff;
                 border: 1px solid #dbe3ee;
@@ -503,6 +550,7 @@ class FloatingWindow(QMainWindow):
                 self.capture_full_screen,
             )
             self.hotkeys.register(HOTKEY_REGION, self.config.region_hotkey, self.capture_region)
+            self.hotkeys.register(HOTKEY_COLLAPSE, self.config.collapse_hotkey, self.toggle_collapsed)
             self._set_ready_status()
         except Exception as exc:  # noqa: BLE001 - show actionable shortcut conflicts in-app.
             self.status.setText(str(exc))
@@ -560,17 +608,26 @@ class FloatingWindow(QMainWindow):
             )
 
         if not self._has_message_bubbles():
-            self.chat_layout.insertWidget(0, self.empty_label)
+            self.chat_layout.insertWidget(self._message_insert_index(), self.empty_label)
             self.empty_label.show()
         self.loading_project = False
 
     def _clear_chat(self) -> None:
-        self.empty_label.setParent(None)
-        while self.chat_layout.count() > 1:
-            item = self.chat_layout.takeAt(0)
+        for index in reversed(range(self.chat_layout.count())):
+            item = self.chat_layout.itemAt(index)
             widget = item.widget()
-            if widget:
+            if widget is self.empty_label:
+                self.chat_layout.takeAt(index)
+                widget.setParent(None)
+            elif isinstance(widget, ChatBubble):
+                self.chat_layout.takeAt(index)
                 widget.deleteLater()
+
+    def _message_insert_index(self) -> int:
+        for index in range(self.chat_layout.count()):
+            if self.chat_layout.itemAt(index).spacerItem():
+                return index
+        return max(0, self.chat_layout.count() - 1)
 
     def _has_message_bubbles(self) -> bool:
         for index in range(self.chat_layout.count()):
@@ -608,7 +665,7 @@ class FloatingWindow(QMainWindow):
         bubble.retry_translation_button.clicked.connect(
             lambda checked=False, bubble=bubble: self.retry_translation_only(bubble)
         )
-        self.chat_layout.insertWidget(max(0, self.chat_layout.count() - 1), bubble)
+        self.chat_layout.insertWidget(self._message_insert_index(), bubble)
         return bubble
 
     def _bubble_text_changed(self, bubble: ChatBubble) -> None:
@@ -724,6 +781,99 @@ class FloatingWindow(QMainWindow):
     def _region_selected(self, pixmap: QPixmap) -> None:
         self.show()
         self._translate_pixmap(pixmap)
+
+    def import_clipboard_image(self) -> None:
+        app = QApplication.instance()
+        if not app:
+            return
+
+        clipboard = app.clipboard()
+        mime_data = clipboard.mimeData()
+        pixmap = QPixmap()
+        source = ""
+
+        if mime_data.hasImage():
+            pixmap = QPixmap.fromImage(mime_data.imageData())
+            source = "剪贴板图片"
+        else:
+            text = clipboard.text().strip()
+            try:
+                pixmap, source = self._pixmap_from_clipboard_text(text)
+            except ValueError as exc:
+                self.status.setText(str(exc))
+                QMessageBox.warning(self, "导入失败", str(exc))
+                return
+
+        if pixmap.isNull():
+            message = "剪贴板中没有可识别的图片、图片链接或 base64 图片。"
+            self.status.setText(message)
+            QMessageBox.warning(self, "导入失败", message)
+            return
+
+        self.status.setText(f"已读取{source}，正在识别和翻译...")
+        self._translate_pixmap(pixmap)
+
+    def _pixmap_from_clipboard_text(self, text: str) -> tuple[QPixmap, str]:
+        if not text:
+            raise ValueError("剪贴板文本为空，请先复制网页图片链接或 base64 图片链接。")
+
+        cleaned = text.strip().strip("\"'<>")
+        parsed = urllib.parse.urlparse(cleaned)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            return self._download_pixmap(cleaned), "网页图片链接"
+
+        image_bytes = self._decode_base64_image(cleaned)
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(image_bytes):
+            raise ValueError("剪贴板中的 base64 内容无法解析为图片。")
+        return pixmap, "base64 图片"
+
+    def _download_pixmap(self, url: str) -> QPixmap:
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 screen-translator/1.0",
+                "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            },
+        )
+        self.add_image_box.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            with urllib.request.urlopen(request, timeout=25) as response:
+                content_type = response.headers.get("Content-Type", "")
+                payload = response.read(16 * 1024 * 1024 + 1)
+        except (OSError, urllib.error.URLError) as exc:
+            raise ValueError(f"下载图片失败：{exc}") from exc
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.add_image_box.setEnabled(True)
+
+        if len(payload) > 16 * 1024 * 1024:
+            raise ValueError("图片超过 16MB，已取消导入。")
+
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(payload):
+            if content_type and not content_type.lower().startswith("image/"):
+                raise ValueError(f"链接返回的内容不是图片：{content_type}")
+            raise ValueError("链接内容无法解析为图片。")
+        return pixmap
+
+    @staticmethod
+    def _decode_base64_image(text: str) -> bytes:
+        match = re.match(r"^data:image/[^;]+;base64,(?P<payload>.+)$", text, flags=re.I | re.S)
+        payload = match.group("payload") if match else text
+        payload = re.sub(r"\s+", "", payload)
+        if len(payload) < 32:
+            raise ValueError("剪贴板中没有可识别的图片链接或 base64 图片。")
+
+        padding = "=" * (-len(payload) % 4)
+        try:
+            return base64.b64decode(payload + padding, validate=True)
+        except (binascii.Error, ValueError):
+            try:
+                return base64.urlsafe_b64decode(payload + padding)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError("剪贴板中没有可识别的图片链接或 base64 图片。") from exc
 
     def _translate_pixmap(self, pixmap: QPixmap) -> None:
         project = self.current_project()
@@ -942,6 +1092,7 @@ class FloatingWindow(QMainWindow):
             self.config = dialog.apply_to(self.config)
             save_env_text(dialog.env_text())
             self.store.default_prompt = self.config.prompt
+            self.translator.set_disable_thinking(self.config.disable_thinking)
             save_config(self.config)
             self.hotkeys.unregister_all()
             self._register_hotkeys()
@@ -952,7 +1103,8 @@ class FloatingWindow(QMainWindow):
         context_hint = "无上下文" if project.is_temporary else f"{len(project.context_translations())} 条上下文"
         self.status.setText(
             f"当前项目: {project.name}    {context_hint}    "
-            f"快捷键: 全屏 {self.config.full_screen_hotkey}    选区 {self.config.region_hotkey}"
+            f"快捷键: 全屏 {self.config.full_screen_hotkey}    "
+            f"选区 {self.config.region_hotkey}    收起/展开 {self.config.collapse_hotkey}"
         )
 
     def collapse_to_edge(self) -> None:
@@ -971,6 +1123,12 @@ class FloatingWindow(QMainWindow):
         self._set_collapsed_ui(True)
         self.move(x, y)
         self.collapsed = True
+
+    def toggle_collapsed(self) -> None:
+        if self.collapsed:
+            self.expand_from_edge()
+        else:
+            self.collapse_to_edge()
 
     def expand_from_edge(self) -> None:
         if not self.collapsed:

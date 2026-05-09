@@ -20,6 +20,8 @@ DEFAULT_PROMPT = (
 class AppConfig:
     full_screen_hotkey: str = "Ctrl+Alt+F"
     region_hotkey: str = "Ctrl+Alt+A"
+    collapse_hotkey: str = "Ctrl+Alt+S"
+    disable_thinking: bool = False
     prompt: str = DEFAULT_PROMPT
     temp_prompt: str = DEFAULT_PROMPT
     selected_project_id: str = "__temporary__"
