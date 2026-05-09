@@ -105,15 +105,14 @@ class ModelTestTask(QRunnable):
             client, model = make_openai_client(timeout=20.0)
             request_kwargs = {
                 "model": model,
-                "messages": [{"role": "user", "content": "浣犲ソ"}],
-                "temperature": 1.0,
+                "messages": [{"role": "user", "content": "你好"}]
             }
             if self.disable_thinking:
                 request_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
             response = client.chat.completions.create(**request_kwargs)
             text = (response.choices[0].message.content or "").strip()
             if not text:
-                raise RuntimeError("妯″瀷杩斿洖涓虹┖")
+                raise RuntimeError("模型返回为空")
             self.signals.finished.emit(text)
         except Exception as exc:  # noqa: BLE001 - surface test errors to the UI.
             self.signals.failed.emit(str(exc))
@@ -218,8 +217,8 @@ class TranslationTask(QRunnable):
             if original or translation:
                 return original, translation
 
-        original_match = re.search(r"鍘熸枃[:锛歖\s*(.*?)(?:\n\s*缈昏瘧[:锛歖|\Z)", text, re.S)
-        translation_match = re.search(r"缈昏瘧[:锛歖\s*(.*)\Z", text, re.S)
+        original_match = re.search(r"原文[:：]\s*(.*?)(?:\n\s*翻译[:：]|\Z)", text, re.S)
+        translation_match = re.search(r"翻译[:：]\s*(.*)\Z", text, re.S)
         if original_match or translation_match:
             original = original_match.group(1).strip() if original_match else ""
             translation = translation_match.group(1).strip() if translation_match else text

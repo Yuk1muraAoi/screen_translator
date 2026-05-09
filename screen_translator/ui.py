@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ctypes
 import re
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
-from PyQt5.QtCore import QPoint, QRect, QSize, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QPoint, QSize, Qt, QTimer
 from PyQt5.QtGui import QFont, QIcon, QKeySequence, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
@@ -27,7 +30,6 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QStackedWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -43,6 +45,30 @@ from .translator import Translator
 HOTKEY_FULL_SCREEN = 101
 HOTKEY_REGION = 102
 HOTKEY_COLLAPSE = 103
+APP_USER_MODEL_ID = "YukimuraAoi.ScreenTranslator"
+
+
+def _resource_path(name: str) -> Path:
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir:
+        return Path(bundle_dir) / name
+    return Path(__file__).resolve().parent.parent / name
+
+
+def app_icon() -> QIcon:
+    icon_path = _resource_path("logo.jpg")
+    if icon_path.exists():
+        return QIcon(str(icon_path))
+    return QIcon()
+
+
+def set_windows_app_user_model_id() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception:
+        pass
 
 
 def make_button(text: str, tooltip: str = "") -> QPushButton:
@@ -77,70 +103,6 @@ class ShortcutEdit(QLineEdit):
             self.setText(sequence)
 
 
-class SideTabButton(QPushButton):
-    activated = pyqtSignal()
-
-    def __init__(self, text: str, parent: QWidget | None = None) -> None:
-        super().__init__(text, parent)
-        self.dragging = False
-        self.press_pos = QPoint()
-        self.drag_timer = QTimer(self)
-        self.drag_timer.setSingleShot(True)
-        self.drag_timer.setInterval(420)
-        self.drag_timer.timeout.connect(self._start_drag)
-
-    def mousePressEvent(self, event) -> None:
-        if event.button() != Qt.LeftButton:
-            return super().mousePressEvent(event)
-
-        self.dragging = False
-        self.press_pos = event.globalPos()
-        self.setDown(True)
-        self.drag_timer.start()
-        event.accept()
-
-    def mouseMoveEvent(self, event) -> None:
-        if self.dragging:
-            self._move_parent_to_side(event.globalPos())
-            event.accept()
-            return
-
-        if (event.globalPos() - self.press_pos).manhattanLength() > 8:
-            self.drag_timer.stop()
-        event.accept()
-
-    def mouseReleaseEvent(self, event) -> None:
-        if event.button() != Qt.LeftButton:
-            return super().mouseReleaseEvent(event)
-
-        was_dragging = self.dragging
-        self.drag_timer.stop()
-        self.dragging = False
-        self.setCursor(Qt.PointingHandCursor)
-        self.setDown(False)
-        if not was_dragging:
-            self.activated.emit()
-        event.accept()
-
-    def _start_drag(self) -> None:
-        self.dragging = True
-        self.setCursor(Qt.SizeAllCursor)
-
-    def _move_parent_to_side(self, global_pos: QPoint) -> None:
-        window = self.window()
-        screen = QApplication.screenAt(global_pos) or QApplication.primaryScreen()
-        screen_geometry = screen.availableGeometry()
-        side = "left" if global_pos.x() < screen_geometry.center().x() else "right"
-        x = screen_geometry.left() if side == "left" else screen_geometry.right() - window.width() + 1
-        y = max(
-            screen_geometry.top(),
-            min(global_pos.y() - window.height() // 2, screen_geometry.bottom() - window.height() + 1),
-        )
-        if hasattr(window, "edge"):
-            window.edge = side
-        window.move(x, y)
-
-
 class SettingsDialog(QDialog):
     def __init__(self, config: AppConfig, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -165,7 +127,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.full_hotkey)
         layout.addWidget(QLabel("选区截图快捷键"))
         layout.addWidget(self.region_hotkey)
-        layout.addWidget(QLabel("收起/展开快捷键"))
+        layout.addWidget(QLabel("收起/唤起快捷键"))
         layout.addWidget(self.collapse_hotkey)
         layout.addWidget(self.disable_thinking)
         layout.addWidget(QLabel("全局默认提示词"))
@@ -331,17 +293,13 @@ class FloatingWindow(QMainWindow):
         self.hotkeys = GlobalHotkeyManager()
         self.drag_position: QPoint | None = None
         self.region_selector: RegionSelector | None = None
-        self.expanded_geometry: QRect | None = None
-        self.side_tab: QPushButton | None = None
-        self.collapsed = False
-        self.edge = "right"
         self.current_project_id = TEMP_PROJECT_ID
         self.loading_project = False
         self.temp_pixmaps: dict[int, QPixmap] = {}
 
         self.setWindowTitle("截图翻译")
-        self.setWindowIcon(QIcon())
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setWindowIcon(app_icon())
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.resize(max(self.config.window_width, 620), max(self.config.window_height, 620))
         self._build_ui()
@@ -354,12 +312,9 @@ class FloatingWindow(QMainWindow):
             app.installNativeEventFilter(self.hotkeys)
 
     def _build_ui(self) -> None:
-        self.central_stack = QStackedWidget()
-        self.setCentralWidget(self.central_stack)
-
         root = QWidget()
         root.setObjectName("root")
-        self.central_stack.addWidget(root)
+        self.setCentralWidget(root)
 
         self.title = QLabel("截图翻译")
         self.title.setObjectName("title")
@@ -369,7 +324,7 @@ class FloatingWindow(QMainWindow):
         self.region_button = make_button("选区", "框选屏幕区域并翻译")
         self.delete_last_button = make_button("删末轮", "删除当前项目最后一轮截图和翻译结果")
         self.settings_button = make_button("设置", "修改全局快捷键和默认提示词")
-        self.collapse_button = make_button("收起", "收缩成侧边栏")
+        self.collapse_button = make_button("收起", "收起到任务栏")
         self.close_button = make_button("×", "退出")
         self.close_button.setFixedWidth(38)
 
@@ -377,7 +332,7 @@ class FloatingWindow(QMainWindow):
         self.region_button.clicked.connect(self.capture_region)
         self.delete_last_button.clicked.connect(self.delete_last_round)
         self.settings_button.clicked.connect(self.open_settings)
-        self.collapse_button.clicked.connect(self.collapse_to_edge)
+        self.collapse_button.clicked.connect(self.minimize_to_taskbar)
         self.close_button.clicked.connect(QApplication.quit)
 
         header = QHBoxLayout()
@@ -550,7 +505,7 @@ class FloatingWindow(QMainWindow):
                 self.capture_full_screen,
             )
             self.hotkeys.register(HOTKEY_REGION, self.config.region_hotkey, self.capture_region)
-            self.hotkeys.register(HOTKEY_COLLAPSE, self.config.collapse_hotkey, self.toggle_collapsed)
+            self.hotkeys.register(HOTKEY_COLLAPSE, self.config.collapse_hotkey, self.toggle_taskbar_visibility)
             self._set_ready_status()
         except Exception as exc:  # noqa: BLE001 - show actionable shortcut conflicts in-app.
             self.status.setText(str(exc))
@@ -756,7 +711,7 @@ class FloatingWindow(QMainWindow):
         self.status.setText(f"已删除最后一轮翻译：第 {deleted.round} 轮。")
 
     def capture_full_screen(self) -> None:
-        self.expand_from_edge()
+        self.restore_from_taskbar()
         self.hide()
         QTimer.singleShot(180, self._capture_full_screen_after_hide)
 
@@ -766,7 +721,7 @@ class FloatingWindow(QMainWindow):
         self._translate_pixmap(pixmap)
 
     def capture_region(self) -> None:
-        self.expand_from_edge()
+        self.restore_from_taskbar()
         self.hide()
         QTimer.singleShot(180, self._show_region_selector)
 
@@ -1104,72 +1059,25 @@ class FloatingWindow(QMainWindow):
         self.status.setText(
             f"当前项目: {project.name}    {context_hint}    "
             f"快捷键: 全屏 {self.config.full_screen_hotkey}    "
-            f"选区 {self.config.region_hotkey}    收起/展开 {self.config.collapse_hotkey}"
+            f"选区 {self.config.region_hotkey}    收起/唤起 {self.config.collapse_hotkey}"
         )
 
-    def collapse_to_edge(self) -> None:
-        if self.collapsed:
-            return
-        self.expanded_geometry = self.geometry()
-        screen = QApplication.screenAt(self.geometry().center()) or QApplication.primaryScreen()
-        screen_geometry = screen.availableGeometry()
-        center_x = self.geometry().center().x()
-        self.edge = "left" if center_x < screen_geometry.center().x() else "right"
-        width = 42
-        height = 156
-        x = screen_geometry.left() if self.edge == "left" else screen_geometry.right() - width + 1
-        y = max(screen_geometry.top() + 40, min(self.y(), screen_geometry.bottom() - height))
-        self.setFixedSize(width, height)
-        self._set_collapsed_ui(True)
-        self.move(x, y)
-        self.collapsed = True
+    def minimize_to_taskbar(self) -> None:
+        self.showMinimized()
 
-    def toggle_collapsed(self) -> None:
-        if self.collapsed:
-            self.expand_from_edge()
+    def restore_from_taskbar(self) -> None:
+        if self.isMinimized():
+            self.showNormal()
+        elif not self.isVisible():
+            self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def toggle_taskbar_visibility(self) -> None:
+        if self.isMinimized() or not self.isVisible():
+            self.restore_from_taskbar()
         else:
-            self.collapse_to_edge()
-
-    def expand_from_edge(self) -> None:
-        if not self.collapsed:
-            return
-        self.setMinimumSize(0, 0)
-        self.setMaximumSize(16777215, 16777215)
-        self.resize(max(self.config.window_width, 620), max(self.config.window_height, 620))
-        self._set_collapsed_ui(False)
-        if self.expanded_geometry:
-            self.setGeometry(self.expanded_geometry)
-        self.collapsed = False
-
-    def _set_collapsed_ui(self, collapsed: bool) -> None:
-        if collapsed:
-            if self.side_tab is None:
-                self.side_tab = SideTabButton("译\n图")
-                self.side_tab.setObjectName("sideTab")
-                self.side_tab.setCursor(Qt.PointingHandCursor)
-                self.side_tab.activated.connect(self.expand_from_edge)
-                self.side_tab.setStyleSheet(
-                    """
-                    QPushButton#sideTab {
-                        background: #2563eb;
-                        color: white;
-                        border: none;
-                        border-radius: 8px;
-                        font-weight: 700;
-                        font-size: 15px;
-                    }
-                    QPushButton#sideTab:hover { background: #1d4ed8; }
-                    """
-                )
-                self.central_stack.addWidget(self.side_tab)
-            self.central_stack.setCurrentWidget(self.side_tab)
-        else:
-            self.central_stack.setCurrentIndex(0)
-
-    def mouseDoubleClickEvent(self, event) -> None:
-        if self.collapsed:
-            self.expand_from_edge()
-        super().mouseDoubleClickEvent(event)
+            self.minimize_to_taskbar()
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
@@ -1186,9 +1094,8 @@ class FloatingWindow(QMainWindow):
         super().mouseReleaseEvent(event)
 
     def closeEvent(self, event) -> None:
-        if not self.collapsed:
-            self.config.window_width = max(620, self.width())
-            self.config.window_height = max(420, self.height())
+        self.config.window_width = max(620, self.width())
+        self.config.window_height = max(420, self.height())
         self.config.selected_project_id = self.current_project_id
         self.config.temp_prompt = self.store.temp_project.prompt
         save_config(self.config)
@@ -1197,7 +1104,11 @@ class FloatingWindow(QMainWindow):
 
 
 def run_app() -> int:
+    set_windows_app_user_model_id()
     app = QApplication.instance() or QApplication([])
+    app.setApplicationName("ScreenTranslator")
+    app.setApplicationDisplayName("ScreenTranslator")
+    app.setWindowIcon(app_icon())
     app.setQuitOnLastWindowClosed(True)
     window = FloatingWindow()
     screen_geometry = virtual_geometry()
