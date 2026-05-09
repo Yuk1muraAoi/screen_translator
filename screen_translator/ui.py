@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PyQt5.QtCore import QPoint, QRect, QSize, Qt, QTimer
+from PyQt5.QtCore import QPoint, QRect, QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QIcon, QKeySequence, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
@@ -59,6 +59,70 @@ class ShortcutEdit(QLineEdit):
         sequence = sequence.replace(",", "").replace("Meta", "Win")
         if sequence:
             self.setText(sequence)
+
+
+class SideTabButton(QPushButton):
+    activated = pyqtSignal()
+
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self.dragging = False
+        self.press_pos = QPoint()
+        self.drag_timer = QTimer(self)
+        self.drag_timer.setSingleShot(True)
+        self.drag_timer.setInterval(420)
+        self.drag_timer.timeout.connect(self._start_drag)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton:
+            return super().mousePressEvent(event)
+
+        self.dragging = False
+        self.press_pos = event.globalPos()
+        self.setDown(True)
+        self.drag_timer.start()
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self.dragging:
+            self._move_parent_to_side(event.globalPos())
+            event.accept()
+            return
+
+        if (event.globalPos() - self.press_pos).manhattanLength() > 8:
+            self.drag_timer.stop()
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton:
+            return super().mouseReleaseEvent(event)
+
+        was_dragging = self.dragging
+        self.drag_timer.stop()
+        self.dragging = False
+        self.setCursor(Qt.PointingHandCursor)
+        self.setDown(False)
+        if not was_dragging:
+            self.activated.emit()
+        event.accept()
+
+    def _start_drag(self) -> None:
+        self.dragging = True
+        self.setCursor(Qt.SizeAllCursor)
+
+    def _move_parent_to_side(self, global_pos: QPoint) -> None:
+        window = self.window()
+        screen = QApplication.screenAt(global_pos) or QApplication.primaryScreen()
+        screen_geometry = screen.availableGeometry()
+        side = "left" if global_pos.x() < screen_geometry.center().x() else "right"
+        x = screen_geometry.left() if side == "left" else screen_geometry.right() - window.width() + 1
+        y = max(
+            screen_geometry.top(),
+            min(global_pos.y() - window.height() // 2, screen_geometry.bottom() - window.height() + 1),
+        )
+        if hasattr(window, "edge"):
+            window.edge = side
+        window.move(x, y)
 
 
 class SettingsDialog(QDialog):
@@ -120,6 +184,7 @@ class ChatBubble(QFrame):
         project_id: str,
         round_number: int,
         pixmap: QPixmap | None,
+        original_text: str = "",
         text: str = "",
     ) -> None:
         super().__init__()
@@ -139,22 +204,36 @@ class ChatBubble(QFrame):
             self.image.setText("图片文件缺失")
             self.image.setObjectName("missingImage")
 
+        original_label = QLabel("原文")
+        original_label.setObjectName("fieldLabel")
+        self.original_text = QTextEdit(original_text)
+        self.original_text.setPlaceholderText("模型识别出的原文会显示在这里，也可以直接手动修改。")
+        self.original_text.setMinimumHeight(96)
+
+        translation_label = QLabel("翻译")
+        translation_label.setObjectName("fieldLabel")
         self.translation = QTextEdit(text)
         self.translation.setPlaceholderText("翻译结果会显示在这里，也可以直接手动修改。")
         self.translation.setMinimumHeight(120)
 
         self.retry_button = make_button("重试", "使用同一张截图重新调用模型")
         self.retry_button.setFixedWidth(72)
+        self.retry_translation_button = make_button("重试翻译", "使用当前原文重新翻译")
+        self.retry_translation_button.setFixedWidth(96)
 
         footer = QHBoxLayout()
         footer.setContentsMargins(0, 0, 0, 0)
         footer.addStretch(1)
         footer.addWidget(self.retry_button)
+        footer.addWidget(self.retry_translation_button)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
         layout.addWidget(self.image)
+        layout.addWidget(original_label)
+        layout.addWidget(self.original_text)
+        layout.addWidget(translation_label)
         layout.addWidget(self.translation)
         layout.addLayout(footer)
 
@@ -162,6 +241,14 @@ class ChatBubble(QFrame):
         self.translation.blockSignals(True)
         self.translation.setPlainText(text)
         self.translation.blockSignals(False)
+
+    def set_texts(self, original_text: str, translation: str) -> None:
+        self.original_text.blockSignals(True)
+        self.translation.blockSignals(True)
+        self.original_text.setPlainText(original_text)
+        self.translation.setPlainText(translation)
+        self.translation.blockSignals(False)
+        self.original_text.blockSignals(False)
 
 
 class FloatingWindow(QMainWindow):
@@ -327,6 +414,10 @@ class FloatingWindow(QMainWindow):
                 background: #f1f5f9;
                 border-radius: 6px;
             }
+            QLabel#fieldLabel {
+                color: #334155;
+                font-weight: 700;
+            }
             QLabel#status {
                 color: #64748b;
                 padding: 6px 12px 10px 12px;
@@ -421,7 +512,13 @@ class FloatingWindow(QMainWindow):
             if record.round == 0:
                 continue
             pixmap = self._pixmap_for_record(project, record)
-            self._add_bubble(project.project_id, record.round, pixmap, record.translation)
+            self._add_bubble(
+                project.project_id,
+                record.round,
+                pixmap,
+                record.original_text,
+                record.translation,
+            )
 
         if not self._has_message_bubbles():
             self.chat_layout.insertWidget(0, self.empty_label)
@@ -460,23 +557,29 @@ class FloatingWindow(QMainWindow):
         project_id: str,
         round_number: int,
         pixmap: QPixmap | None,
+        original_text: str,
         text: str,
     ) -> ChatBubble:
         self.empty_label.hide()
         self.empty_label.setParent(None)
-        bubble = ChatBubble(project_id, round_number, pixmap, text)
+        bubble = ChatBubble(project_id, round_number, pixmap, original_text, text)
+        bubble.original_text.textChanged.connect(lambda bubble=bubble: self._bubble_text_changed(bubble))
         bubble.translation.textChanged.connect(lambda bubble=bubble: self._bubble_text_changed(bubble))
         bubble.retry_button.clicked.connect(lambda checked=False, bubble=bubble: self.retry_translation(bubble))
+        bubble.retry_translation_button.clicked.connect(
+            lambda checked=False, bubble=bubble: self.retry_translation_only(bubble)
+        )
         self.chat_layout.insertWidget(max(0, self.chat_layout.count() - 1), bubble)
         return bubble
 
     def _bubble_text_changed(self, bubble: ChatBubble) -> None:
         if self.loading_project:
             return
-        self.store.update_record_translation(
+        self.store.update_record_texts(
             bubble.project_id,
             bubble.round_number,
-            bubble.translation.toPlainText(),
+            original_text=bubble.original_text.toPlainText(),
+            translation=bubble.translation.toPlainText(),
         )
 
     def current_project(self) -> TranslationProject:
@@ -586,21 +689,29 @@ class FloatingWindow(QMainWindow):
     def _translate_pixmap(self, pixmap: QPixmap) -> None:
         project = self.current_project()
         context = project.context_translations()
-        record = self.store.add_record(project.project_id, pixmap, "正在翻译...")
+        record = self.store.add_record(project.project_id, pixmap, "正在识别原文...", "正在翻译...")
         if project.is_temporary:
             self.temp_pixmaps[record.round] = pixmap
 
-        bubble = self._add_bubble(project.project_id, record.round, pixmap, record.translation)
+        bubble = self._add_bubble(
+            project.project_id,
+            record.round,
+            pixmap,
+            record.original_text,
+            record.translation,
+        )
         bubble.retry_button.setEnabled(False)
+        bubble.retry_translation_button.setEnabled(False)
         self.translator.translate(
             pixmap,
             project.prompt,
             context,
             on_started=lambda: self.status.setText("正在调用大模型 API..."),
-            on_finished=lambda text, pid=project.project_id, rnd=record.round: self._translation_finished(
+            on_finished=lambda original, translation, pid=project.project_id, rnd=record.round: self._translation_finished(
                 pid,
                 rnd,
-                text,
+                original,
+                translation,
             ),
             on_failed=lambda error, pid=project.project_id, rnd=record.round: self._translation_failed(
                 pid,
@@ -622,29 +733,27 @@ class FloatingWindow(QMainWindow):
             self.status.setText("重试失败：找不到原始截图。")
             return
 
-        context = [
-            item.translation.strip()
-            for item in project.records
-            if item.round > 0
-            and item.round != bubble.round_number
-            and item.translation.strip()
-            and item.translation.strip() != "正在翻译..."
-            and item.translation.strip() != "正在重新翻译..."
-            and not item.translation.strip().startswith("翻译失败:")
-        ]
+        context = self._context_excluding(project, bubble.round_number)
 
         bubble.retry_button.setEnabled(False)
-        bubble.set_translation("正在重新翻译...")
-        self.store.update_record_translation(project.project_id, bubble.round_number, "正在重新翻译...")
+        bubble.retry_translation_button.setEnabled(False)
+        bubble.set_texts("正在重新识别原文...", "正在重新翻译...")
+        self.store.update_record_texts(
+            project.project_id,
+            bubble.round_number,
+            original_text="正在重新识别原文...",
+            translation="正在重新翻译...",
+        )
         self.translator.translate(
             pixmap,
             project.prompt,
             context,
-            on_started=lambda: self.status.setText("正在重试调用大模型 API..."),
-            on_finished=lambda text, pid=project.project_id, rnd=bubble.round_number: self._translation_finished(
+            on_started=lambda: self.status.setText("正在重试完整识别和翻译..."),
+            on_finished=lambda original, translation, pid=project.project_id, rnd=bubble.round_number: self._translation_finished(
                 pid,
                 rnd,
-                text,
+                original,
+                translation,
             ),
             on_failed=lambda error, pid=project.project_id, rnd=bubble.round_number: self._translation_failed(
                 pid,
@@ -653,28 +762,114 @@ class FloatingWindow(QMainWindow):
             ),
         )
 
+    def retry_translation_only(self, bubble: ChatBubble) -> None:
+        project = self.store.get(bubble.project_id)
+        record = self._record_for(project, bubble.round_number)
+        if not record:
+            self.status.setText("重试翻译失败：找不到这条翻译记录。")
+            return
+
+        pixmap = self._pixmap_for_record(project, record)
+        if not pixmap or pixmap.isNull():
+            self.status.setText("重试翻译失败：找不到原始截图。")
+            return
+
+        original_text = bubble.original_text.toPlainText().strip()
+        if not original_text:
+            self.status.setText("重试翻译失败：原文为空。")
+            return
+
+        context = self._context_excluding(project, bubble.round_number)
+        context.append(f"当前原文:\n{original_text}")
+
+        bubble.retry_button.setEnabled(False)
+        bubble.retry_translation_button.setEnabled(False)
+        bubble.set_translation("正在重新翻译...")
+        self.store.update_record_texts(
+            project.project_id,
+            bubble.round_number,
+            original_text=original_text,
+            translation="正在重新翻译...",
+        )
+        self.translator.translate_text(
+            pixmap,
+            project.prompt,
+            original_text,
+            context,
+            on_started=lambda: self.status.setText("正在基于原文重试翻译..."),
+            on_finished=lambda original, translation, pid=project.project_id, rnd=bubble.round_number: self._translation_finished(
+                pid,
+                rnd,
+                original,
+                translation,
+            ),
+            on_failed=lambda error, pid=project.project_id, rnd=bubble.round_number: self._translation_failed(
+                pid,
+                rnd,
+                error,
+            ),
+        )
+
+    def _context_excluding(self, project: TranslationProject, round_number: int) -> list[str]:
+        context: list[str] = []
+        for item in project.records:
+            original = item.original_text.strip()
+            translation = item.translation.strip()
+            if item.round <= 0 or item.round == round_number:
+                continue
+            if translation in {"正在翻译...", "正在重新翻译..."} or translation.startswith("翻译失败:"):
+                continue
+            if original:
+                context.append(f"原文:\n{original}\n翻译:\n{translation}")
+            elif translation:
+                context.append(f"翻译:\n{translation}")
+        return context
+
     def _record_for(self, project: TranslationProject, round_number: int) -> TranslationRecord | None:
         for record in project.records:
             if record.round == round_number:
                 return record
         return None
 
-    def _translation_finished(self, project_id: str, round_number: int, text: str) -> None:
-        result = text or "未返回翻译结果"
-        self.store.update_record_translation(project_id, round_number, result)
+    def _translation_finished(
+        self,
+        project_id: str,
+        round_number: int,
+        original_text: str,
+        translation: str,
+    ) -> None:
+        original = original_text or ""
+        result = translation or "未返回翻译结果"
+        self.store.update_record_texts(
+            project_id,
+            round_number,
+            original_text=original,
+            translation=result,
+        )
         bubble = self._find_bubble(project_id, round_number)
         if bubble:
-            bubble.set_translation(result)
+            bubble.set_texts(original, result)
             bubble.retry_button.setEnabled(True)
+            bubble.retry_translation_button.setEnabled(True)
         self.status.setText("翻译完成，可直接编辑结果。")
 
     def _translation_failed(self, project_id: str, round_number: int, error: str) -> None:
         result = f"翻译失败:\n{error}"
-        self.store.update_record_translation(project_id, round_number, result)
         bubble = self._find_bubble(project_id, round_number)
+        original = ""
         if bubble:
-            bubble.set_translation(result)
+            original = bubble.original_text.toPlainText()
+            if original in {"正在识别原文...", "正在重新识别原文..."}:
+                original = ""
+            bubble.set_texts(original, result)
             bubble.retry_button.setEnabled(True)
+            bubble.retry_translation_button.setEnabled(True)
+        self.store.update_record_texts(
+            project_id,
+            round_number,
+            original_text=original,
+            translation=result,
+        )
         self.status.setText("翻译失败，请检查 .env、网络或模型是否支持图片输入。")
 
     def _find_bubble(self, project_id: str, round_number: int) -> ChatBubble | None:
@@ -736,10 +931,10 @@ class FloatingWindow(QMainWindow):
     def _set_collapsed_ui(self, collapsed: bool) -> None:
         if collapsed:
             if self.side_tab is None:
-                self.side_tab = QPushButton("译\n图")
+                self.side_tab = SideTabButton("译\n图")
                 self.side_tab.setObjectName("sideTab")
                 self.side_tab.setCursor(Qt.PointingHandCursor)
-                self.side_tab.clicked.connect(self.expand_from_edge)
+                self.side_tab.activated.connect(self.expand_from_edge)
                 self.side_tab.setStyleSheet(
                     """
                     QPushButton#sideTab {
@@ -775,18 +970,7 @@ class FloatingWindow(QMainWindow):
 
     def mouseReleaseEvent(self, event) -> None:
         self.drag_position = None
-        if not self.collapsed and self._touching_screen_edge():
-            self.collapse_to_edge()
         super().mouseReleaseEvent(event)
-
-    def _touching_screen_edge(self) -> bool:
-        screen = QApplication.screenAt(self.geometry().center()) or QApplication.primaryScreen()
-        screen_geometry = screen.availableGeometry()
-        margin = 4
-        return (
-            self.x() <= screen_geometry.left() + margin
-            or self.geometry().right() >= screen_geometry.right() - margin
-        )
 
     def closeEvent(self, event) -> None:
         if not self.collapsed:

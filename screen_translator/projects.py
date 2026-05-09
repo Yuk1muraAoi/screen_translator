@@ -22,7 +22,8 @@ TEMP_PROJECT_NAME = "临时翻译"
 class TranslationRecord:
     round: int
     image_url: str
-    translation: str
+    original_text: str = ""
+    translation: str = ""
 
 
 @dataclass
@@ -39,12 +40,18 @@ class TranslationProject:
             return []
         context: list[str] = []
         for record in self.records:
-            text = record.translation.strip()
-            if record.round <= 0 or not text:
+            original = record.original_text.strip()
+            translation = record.translation.strip()
+            if record.round <= 0:
                 continue
-            if text in {"正在翻译...", "正在重新翻译..."} or text.startswith("翻译失败:"):
+            if translation in {"正在翻译...", "正在重新翻译..."} or translation.startswith("翻译失败:"):
                 continue
-            context.append(text)
+            if not original and not translation:
+                continue
+            if original:
+                context.append(f"原文:\n{original}\n翻译:\n{translation}")
+            elif translation:
+                context.append(f"翻译:\n{translation}")
         return context
 
 
@@ -73,7 +80,7 @@ class ProjectStore:
             name=TEMP_PROJECT_NAME,
             prompt=temp_prompt or default_prompt,
             is_temporary=True,
-            records=[TranslationRecord(round=0, image_url="", translation=temp_prompt or default_prompt)],
+            records=[TranslationRecord(round=0, image_url="", original_text="", translation=temp_prompt or default_prompt)],
         )
         self.projects: dict[str, TranslationProject] = {}
         self.load_projects()
@@ -105,7 +112,7 @@ class ProjectStore:
             name=project_path.name,
             prompt=prompt or self.default_prompt,
             path=project_path,
-            records=[TranslationRecord(round=0, image_url="", translation=prompt or self.default_prompt)],
+            records=[TranslationRecord(round=0, image_url="", original_text="", translation=prompt or self.default_prompt)],
         )
         self.projects[project.project_id] = project
         self.save_project(project)
@@ -163,11 +170,17 @@ class ProjectStore:
         if project.records:
             project.records[0].translation = prompt
         else:
-            project.records.append(TranslationRecord(round=0, image_url="", translation=prompt))
+            project.records.append(TranslationRecord(round=0, image_url="", original_text="", translation=prompt))
         if not project.is_temporary:
             self.save_project(project)
 
-    def add_record(self, project_id: str, pixmap: QPixmap, translation: str = "") -> TranslationRecord:
+    def add_record(
+        self,
+        project_id: str,
+        pixmap: QPixmap,
+        original_text: str = "",
+        translation: str = "",
+    ) -> TranslationRecord:
         project = self.get(project_id)
         round_number = self._next_round(project)
         image_url = ""
@@ -178,20 +191,37 @@ class ProjectStore:
             image_url = f"images/round_{round_number}.png"
             pixmap.save(str(project.path / image_url), "PNG")
 
-        record = TranslationRecord(round=round_number, image_url=image_url, translation=translation)
+        record = TranslationRecord(
+            round=round_number,
+            image_url=image_url,
+            original_text=original_text,
+            translation=translation,
+        )
         project.records.append(record)
         if not project.is_temporary:
             self.save_project(project)
         return record
 
-    def update_record_translation(self, project_id: str, round_number: int, translation: str) -> None:
+    def update_record_texts(
+        self,
+        project_id: str,
+        round_number: int,
+        original_text: str | None = None,
+        translation: str | None = None,
+    ) -> None:
         project = self.get(project_id)
         for record in project.records:
             if record.round == round_number:
-                record.translation = translation
+                if original_text is not None:
+                    record.original_text = original_text
+                if translation is not None:
+                    record.translation = translation
                 break
         if not project.is_temporary:
             self.save_project(project)
+
+    def update_record_translation(self, project_id: str, round_number: int, translation: str) -> None:
+        self.update_record_texts(project_id, round_number, translation=translation)
 
     def image_path_for(self, project: TranslationProject, record: TranslationRecord) -> Path | None:
         if project.is_temporary or not project.path or not record.image_url:
@@ -203,7 +233,12 @@ class ProjectStore:
             return
         project.path.mkdir(parents=True, exist_ok=True)
         payload = [
-            {"round": record.round, "image_url": record.image_url, "translation": record.translation}
+            {
+                "round": record.round,
+                "image_url": record.image_url,
+                "original_text": record.original_text,
+                "translation": record.translation,
+            }
             for record in project.records
         ]
         (project.path / PROJECT_FILE).write_text(
@@ -222,6 +257,7 @@ class ProjectStore:
                         TranslationRecord(
                             round=int(item.get("round", len(records))),
                             image_url=str(item.get("image_url", "")),
+                            original_text=str(item.get("original_text", "")),
                             translation=str(item.get("translation", "")),
                         )
                     )
@@ -229,7 +265,7 @@ class ProjectStore:
                 records = []
 
         if not records:
-            records = [TranslationRecord(round=0, image_url="", translation=self.default_prompt)]
+            records = [TranslationRecord(round=0, image_url="", original_text="", translation=self.default_prompt)]
 
         return TranslationProject(
             project_id=project_dir.name,
