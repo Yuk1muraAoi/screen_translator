@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (
 )
 
 from .capture import RegionSelector, capture_desktop, virtual_geometry
-from .config import AppConfig, load_config, save_config
+from .config import AppConfig, load_config, load_env_text, save_config, save_env_text
 from .hotkeys import GlobalHotkeyManager
 from .projects import ProjectStore, TEMP_PROJECT_ID, TranslationProject, TranslationRecord
 from .translator import Translator
@@ -42,6 +42,13 @@ def make_button(text: str, tooltip: str = "") -> QPushButton:
     button.setToolTip(tooltip)
     button.setMinimumHeight(34)
     return button
+
+
+def make_plain_text_edit(text: str = "") -> QTextEdit:
+    editor = QTextEdit()
+    editor.setAcceptRichText(False)
+    editor.setPlainText(text)
+    return editor
 
 
 class ShortcutEdit(QLineEdit):
@@ -128,13 +135,17 @@ class SideTabButton(QPushButton):
 class SettingsDialog(QDialog):
     def __init__(self, config: AppConfig, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.model_tester = Translator()
         self.setWindowTitle("设置")
         self.setMinimumWidth(520)
 
         self.full_hotkey = ShortcutEdit(config.full_screen_hotkey)
         self.region_hotkey = ShortcutEdit(config.region_hotkey)
-        self.prompt = QTextEdit(config.prompt)
+        self.prompt = make_plain_text_edit(config.prompt)
         self.prompt.setMinimumHeight(160)
+        self.env_editor = make_plain_text_edit(load_env_text())
+        self.env_editor.setMinimumHeight(150)
+        self.env_editor.setPlaceholderText("OPENAI_API_KEY=\nOPENAI_API_BASE=\nMODEL_NAME=")
 
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
@@ -144,6 +155,11 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.region_hotkey)
         layout.addWidget(QLabel("全局默认提示词"))
         layout.addWidget(self.prompt)
+        layout.addWidget(QLabel("模型 .env 配置"))
+        layout.addWidget(self.env_editor)
+        self.test_model_button = make_button("测试模型", "发送“你好”测试当前模型配置")
+        self.test_model_button.clicked.connect(self.test_model)
+        layout.addWidget(self.test_model_button)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -156,13 +172,36 @@ class SettingsDialog(QDialog):
         config.prompt = self.prompt.toPlainText().strip()
         return config
 
+    def env_text(self) -> str:
+        return self.env_editor.toPlainText()
+
+    def test_model(self) -> None:
+        save_env_text(self.env_text())
+        self.test_model_button.setEnabled(False)
+        self.test_model_button.setText("测试中...")
+        self.model_tester.test_model(
+            on_started=lambda: None,
+            on_finished=self._model_test_finished,
+            on_failed=self._model_test_failed,
+        )
+
+    def _model_test_finished(self, text: str) -> None:
+        self.test_model_button.setEnabled(True)
+        self.test_model_button.setText("测试模型")
+        QMessageBox.information(self, "测试成功", f"模型正常返回：\n{text}")
+
+    def _model_test_failed(self, error: str) -> None:
+        self.test_model_button.setEnabled(True)
+        self.test_model_button.setText("测试模型")
+        QMessageBox.warning(self, "测试失败", error)
+
 
 class PromptDialog(QDialog):
     def __init__(self, title: str, prompt: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setMinimumWidth(560)
-        self.editor = QTextEdit(prompt)
+        self.editor = make_plain_text_edit(prompt)
         self.editor.setMinimumHeight(220)
 
         layout = QVBoxLayout(self)
@@ -206,13 +245,13 @@ class ChatBubble(QFrame):
 
         original_label = QLabel("原文")
         original_label.setObjectName("fieldLabel")
-        self.original_text = QTextEdit(original_text)
+        self.original_text = make_plain_text_edit(original_text)
         self.original_text.setPlaceholderText("模型识别出的原文会显示在这里，也可以直接手动修改。")
         self.original_text.setMinimumHeight(96)
 
         translation_label = QLabel("翻译")
         translation_label.setObjectName("fieldLabel")
-        self.translation = QTextEdit(text)
+        self.translation = make_plain_text_edit(text)
         self.translation.setPlaceholderText("翻译结果会显示在这里，也可以直接手动修改。")
         self.translation.setMinimumHeight(120)
 
@@ -735,8 +774,7 @@ class FloatingWindow(QMainWindow):
 
         context = self._context_excluding(project, bubble.round_number)
 
-        bubble.retry_button.setEnabled(False)
-        bubble.retry_translation_button.setEnabled(False)
+        self._disable_retry_buttons_temporarily(bubble)
         bubble.set_texts("正在重新识别原文...", "正在重新翻译...")
         self.store.update_record_texts(
             project.project_id,
@@ -782,8 +820,7 @@ class FloatingWindow(QMainWindow):
         context = self._context_excluding(project, bubble.round_number)
         context.append(f"当前原文:\n{original_text}")
 
-        bubble.retry_button.setEnabled(False)
-        bubble.retry_translation_button.setEnabled(False)
+        self._disable_retry_buttons_temporarily(bubble)
         bubble.set_translation("正在重新翻译...")
         self.store.update_record_texts(
             project.project_id,
@@ -809,6 +846,22 @@ class FloatingWindow(QMainWindow):
                 error,
             ),
         )
+
+    def _disable_retry_buttons_temporarily(self, bubble: ChatBubble) -> None:
+        bubble.retry_button.setEnabled(False)
+        bubble.retry_translation_button.setEnabled(False)
+        project_id = bubble.project_id
+        round_number = bubble.round_number
+        QTimer.singleShot(
+            10000,
+            lambda: self._enable_retry_buttons_if_visible(project_id, round_number),
+        )
+
+    def _enable_retry_buttons_if_visible(self, project_id: str, round_number: int) -> None:
+        bubble = self._find_bubble(project_id, round_number)
+        if bubble:
+            bubble.retry_button.setEnabled(True)
+            bubble.retry_translation_button.setEnabled(True)
 
     def _context_excluding(self, project: TranslationProject, round_number: int) -> list[str]:
         context: list[str] = []
@@ -887,10 +940,12 @@ class FloatingWindow(QMainWindow):
         dialog = SettingsDialog(self.config, self)
         if dialog.exec_() == QDialog.Accepted:
             self.config = dialog.apply_to(self.config)
+            save_env_text(dialog.env_text())
             self.store.default_prompt = self.config.prompt
             save_config(self.config)
             self.hotkeys.unregister_all()
             self._register_hotkeys()
+            self.status.setText("设置已保存，新的模型配置会在下一次翻译时生效。")
 
     def _set_ready_status(self) -> None:
         project = self.current_project()

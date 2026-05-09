@@ -7,6 +7,7 @@ from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent.parent
 CONFIG_PATH = APP_DIR / "config.json"
+ENV_PATH = APP_DIR / ".env"
 
 
 DEFAULT_PROMPT = (
@@ -45,3 +46,16 @@ def save_config(config: AppConfig) -> None:
         json.dumps(asdict(config), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def load_env_text() -> str:
+    if not ENV_PATH.exists():
+        return "OPENAI_API_KEY=\nOPENAI_API_BASE=\nMODEL_NAME=\n"
+    return ENV_PATH.read_text(encoding="utf-8")
+
+
+def save_env_text(text: str) -> None:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if normalized and not normalized.endswith("\n"):
+        normalized += "\n"
+    ENV_PATH.write_text(normalized, encoding="utf-8")

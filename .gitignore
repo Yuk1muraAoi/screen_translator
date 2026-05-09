@@ -4,3 +4,5 @@ __pycache__/
 .env
 config.json
 history/
+api_test/
+AGENTS.md
