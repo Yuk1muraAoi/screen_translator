@@ -1,0 +1,2 @@
+"""Screenshot translation desktop app."""
+
